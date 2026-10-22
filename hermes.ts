@@ -1,11 +1,13 @@
 import { readFile, rm, writeFile } from 'node:fs/promises';
 import { text } from 'node:stream/consumers';
+import { setTimeout } from 'node:timers/promises';
 import { parseArgs } from 'node:util';
 import {
   NotFoundError,
   Sandboxes,
   SandboxesError,
   type ClientCreateOptions,
+  type Process,
   type RunResult,
   type Sandbox,
 } from '@docker/sandboxes';
@@ -17,16 +19,34 @@ const BASE_URLS: Record<string, string> = {
 const SANDBOX_NAME = 'hermes-agent';
 const VOLUME_NAME = 'hermes-state';
 const SECRET_NAME = 'hermes-anthropic';
+const ROOT_HOME = '/home/agent/.hermes';
+const PROFILE = 'persistent';
 // Must stay under ~/.hermes: Hermes v0.22 treats any other HERMES_HOME as a separate install root.
-const HERMES_HOME = '/home/agent/.hermes/profiles/persistent';
+const HERMES_HOME = `${ROOT_HOME}/profiles/${PROFILE}`;
+const GATEWAY_STATE_FILE = `${ROOT_HOME}/gateway_state.json`;
 const FIRST_CYCLE_MS = 3_600_000;
 const LONG_CALL = { timeoutMs: 600_000 };
 const STATE_FILE = new URL('.state.json', import.meta.url);
+const DEFAULT_KIT = 'docker.io/sbx/hermes-agent-kit:latest';
+const GATEWAY_SETTLE_MS = 60_000;
+const POLL_MS = 2_000;
 
 // The public SDK types only model inline kit artifacts, but the service also accepts a kit image reference.
-const HERMES_KIT = {
-  kitReference: { ref: { ref: 'docker.io/sbx/hermes-agent-kit:latest' } },
-} as unknown as NonNullable<ClientCreateOptions['kits']>[number];
+function kitReference(ref: string): NonNullable<ClientCreateOptions['kits']>[number] {
+  return { kitReference: { ref: { ref } } } as unknown as NonNullable<ClientCreateOptions['kits']>[number];
+}
+
+// Run as the agent with the token in its environment, so it never reaches argv or output.
+const WRITE_TELEGRAM_ENV = `set -eu
+env_file="$HERMES_HOME/.env"
+umask 077
+touch "$env_file"
+{
+  grep -v -e '^TELEGRAM_BOT_TOKEN=' -e '^TELEGRAM_ALLOWED_USERS=' "$env_file" || [ $? -eq 1 ]
+  printf 'TELEGRAM_BOT_TOKEN=%s\\nTELEGRAM_ALLOWED_USERS=%s\\n' "$TELEGRAM_BOT_TOKEN" "$TELEGRAM_ALLOWED_USERS"
+} > "$env_file.telegram"
+chmod 600 "$env_file.telegram"
+mv "$env_file.telegram" "$env_file"`;
 
 // What the kit's HERMES_INIT_VOLUME hook does, run as root after create: hand the mount to agent and seed it.
 const PREPARE_SCRIPT = `set -eu
@@ -59,6 +79,7 @@ for var in ANTHROPIC_API_KEY OPENAI_API_KEY OPENROUTER_API_KEY; do
 done`;
 
 interface LaunchMode {
+  kit: string;
   kitHook: boolean;
   alwaysOn: boolean;
   onTimeout: 'restart' | 'stop';
@@ -75,12 +96,13 @@ interface State {
 const USAGE = `usage: node hermes.ts [--env prod|stage] <command>
 
   secret                 store the Anthropic API key piped on stdin (reuses an existing one)
-  launch [--kit-hook] [--always-on] [--on-timeout restart|stop]
+  launch [--kit <ref>] [--kit-hook] [--always-on] [--on-timeout restart|stop]
   ask "<prompt>"         one Hermes turn
   remember "<fact>"      ask Hermes to save a fact to its memory
   recall "<question>"    ask Hermes in a fresh session
+  telegram --user-id <id>  store the bot token piped on stdin, then start the Telegram gateway
   cycle                  stop (hibernate) then start (resume)
-  upgrade                replace the sandbox, keep the state volume
+  upgrade [--kit <ref>]  replace the sandbox, keep the state volume, restart the gateway
   status
   destroy [--volume] [--secret]`;
 
@@ -192,7 +214,7 @@ async function storeSecret(client: Sandboxes, state: State): Promise<void> {
   console.log(`created Anthropic secret ${secret.name}`);
 }
 
-async function launch(client: Sandboxes, state: State, mode: LaunchMode): Promise<void> {
+async function launch(client: Sandboxes, state: State, mode: LaunchMode): Promise<Sandbox> {
   if (state.sandbox) fail(`${state.sandbox} is already recorded; use upgrade, or destroy first`);
   const secret = await findModelSecret(client);
   if (!secret) fail('this account has no Anthropic secret; run secret first');
@@ -207,7 +229,7 @@ async function launch(client: Sandboxes, state: State, mode: LaunchMode): Promis
     sandbox = await client.create(
       {
         displayName: SANDBOX_NAME,
-        kits: [HERMES_KIT],
+        kits: [kitReference(mode.kit)],
         resources: 'small',
         environment: mode.kitHook ? { HERMES_HOME, HERMES_INIT_VOLUME: '1' } : undefined,
         storage: {
@@ -238,7 +260,81 @@ async function launch(client: Sandboxes, state: State, mode: LaunchMode): Promis
     const seeded = outputOf(result, 'preparing the state volume');
     console.log(`prepared ${HERMES_HOME} in ${since(preparedAt)}${seeded ? ` (${seeded.replaceAll('\n', ', ')})` : ''}`);
   }
-  console.log(`sandbox ${sandbox.displayName}  id ${sandbox.uid}  volume ${volume.name}  ready in ${since(startedAt)}`);
+  console.log(`sandbox ${sandbox.displayName}  id ${sandbox.uid}  volume ${volume.name}  kit ${mode.kit}  ready in ${since(startedAt)}`);
+  return sandbox;
+}
+
+interface TelegramStatus {
+  pid?: number;
+  state?: string;
+  error?: string;
+}
+
+// The gateway's own status record; its platform keys are "<profile>:<platform>".
+async function telegramStatus(sandbox: Sandbox): Promise<TelegramStatus | undefined> {
+  const result = await sandbox.processes.run({ args: ['cat', GATEWAY_STATE_FILE] }, LONG_CALL);
+  if (result.exitCode !== 0) return undefined;
+  const record = JSON.parse(result.stdout);
+  const telegram = record.platforms?.[`${PROFILE}:telegram`];
+  return { pid: record.pid, state: telegram?.state, error: telegram?.error_message };
+}
+
+async function gatewayOutput(gateway: Process): Promise<string> {
+  const output = await gateway.readOutput({ resumeFrom: 0 });
+  const decoder = new TextDecoder();
+  return (output.chunks ?? []).map((chunk) => decoder.decode(chunk.data, { stream: true })).join('').trim();
+}
+
+async function startGateway(sandbox: Sandbox): Promise<void> {
+  const startedAt = performance.now();
+  // Default home, since Hermes 0.22 gives a profile no gateway of its own; --replace takes over a running one.
+  // No label: todd keeps labels unique across exited processes too, so a rerun would collide.
+  let gateway = await sandbox.processes.start({
+    args: ['sh', '-lc', 'exec hermes gateway run --replace', 'hermes-gateway'],
+    env: { HERMES_HOME: ROOT_HOME },
+  });
+  let status: TelegramStatus | undefined;
+  while (performance.now() < startedAt + GATEWAY_SETTLE_MS) {
+    await setTimeout(POLL_MS);
+    gateway = await gateway.refresh();
+    if (gateway.state !== 'running') fail(`the gateway exited ${gateway.exitCode}:\n${await gatewayOutput(gateway)}`);
+    status = await telegramStatus(sandbox);
+    // Until the new gateway writes its own record, the file may still describe the one it replaced.
+    if (!status || status.pid !== gateway.pid) continue;
+    if (status.state === 'connected') {
+      console.log(`gateway connected to Telegram in ${since(startedAt)} (pid ${gateway.pid})`);
+      return;
+    }
+    if (status.state === 'fatal') fail(`the gateway could not connect to Telegram: ${status.error}`);
+  }
+  fail(`the gateway had not connected to Telegram after ${since(startedAt)} (state ${status?.state ?? 'unknown'})`);
+}
+
+async function telegramConfigured(sandbox: Sandbox): Promise<boolean> {
+  const result = await sandbox.processes.run(
+    { args: ['grep', '-qs', '^TELEGRAM_BOT_TOKEN=.', `${HERMES_HOME}/.env`] },
+    LONG_CALL,
+  );
+  return result.exitCode === 0;
+}
+
+async function storeTelegram(client: Sandboxes, state: State, userId: string | undefined): Promise<void> {
+  if (!userId || !/^\d+$/.test(userId)) fail('telegram needs --user-id <your numeric Telegram user ID>');
+  const sandbox = await runningSandbox(client, state);
+  if (process.stdin.isTTY) fail('pipe the bot token on stdin; it is never taken from arguments');
+  const token = (await text(process.stdin)).trim();
+  // Hermes' own check for a bot token from @BotFather.
+  if (!/^\d+:[A-Za-z0-9_-]{30,}$/.test(token)) fail('stdin does not look like a Telegram bot token');
+  const result = await sandbox.processes.run(
+    {
+      args: ['sh', '-c', WRITE_TELEGRAM_ENV, 'telegram-env'],
+      env: { HERMES_HOME, TELEGRAM_BOT_TOKEN: token, TELEGRAM_ALLOWED_USERS: userId },
+    },
+    LONG_CALL,
+  );
+  outputOf(result, 'writing the Telegram settings');
+  console.log(`stored the bot token and TELEGRAM_ALLOWED_USERS=${userId} in ${HERMES_HOME}/.env`);
+  await startGateway(sandbox);
 }
 
 async function cycle(client: Sandboxes, state: State): Promise<void> {
@@ -270,11 +366,13 @@ async function removeSandbox(client: Sandboxes, state: State): Promise<void> {
   await saveState(state);
 }
 
-async function upgrade(client: Sandboxes, state: State): Promise<void> {
+async function upgrade(client: Sandboxes, state: State, kit: string | undefined): Promise<void> {
   if (!state.mode) fail('no launch recorded; run launch first');
   const startedAt = performance.now();
   await removeSandbox(client, state);
-  await launch(client, state, state.mode);
+  // Launches recorded before --kit existed have no kit in .state.json.
+  const sandbox = await launch(client, state, { ...state.mode, kit: kit ?? state.mode.kit ?? DEFAULT_KIT });
+  if (await telegramConfigured(sandbox)) await startGateway(sandbox);
   console.log(`upgrade took ${since(startedAt)}`);
 }
 
@@ -287,11 +385,16 @@ async function status(client: Sandboxes, state: State): Promise<void> {
     console.log(
       `timeout  onTimeout ${features?.timeouts?.onTimeout}  autoResume ${features?.lifecycle.autoResume}  next ${features?.timeouts?.expiresAt?.toISOString()}`,
     );
+    if (sandbox.status === 'running') {
+      const telegram = await telegramStatus(sandbox);
+      console.log(`telegram ${telegram?.state ?? 'no gateway'}${telegram?.error ? `: ${telegram.error}` : ''}`);
+    }
   } else {
     console.log('sandbox  none');
   }
   console.log(`volume   ${state.volume ?? 'none'}  mounted at ${HERMES_HOME}`);
   console.log(`mode     ${state.mode ? (state.mode.kitHook ? 'kit-hook' : 'prepare') : 'none'}`);
+  console.log(`kit      ${state.mode ? (state.mode.kit ?? DEFAULT_KIT) : 'none'}`);
   const secret = await findModelSecret(client);
   console.log(`secret   ${secret?.name ?? 'none'}${state.createdSecret ? ' (created here)' : ''}`);
 }
@@ -322,6 +425,8 @@ async function main(): Promise<void> {
     allowPositionals: true,
     options: {
       env: { type: 'string', default: 'prod' },
+      kit: { type: 'string' },
+      'user-id': { type: 'string' },
       'kit-hook': { type: 'boolean', default: false },
       'always-on': { type: 'boolean', default: false },
       'on-timeout': { type: 'string', default: 'restart' },
@@ -348,7 +453,15 @@ async function main(): Promise<void> {
       case 'secret':
         return await storeSecret(client, state);
       case 'launch':
-        return await launch(client, state, { kitHook: values['kit-hook'], alwaysOn: values['always-on'], onTimeout });
+        await launch(client, state, {
+          kit: values.kit ?? DEFAULT_KIT,
+          kitHook: values['kit-hook'],
+          alwaysOn: values['always-on'],
+          onTimeout,
+        });
+        return;
+      case 'telegram':
+        return await storeTelegram(client, state, values['user-id']);
       case 'ask':
       case 'recall':
         console.log(await hermes(await runningSandbox(client, state), ['-z', input!]));
@@ -358,7 +471,7 @@ async function main(): Promise<void> {
       case 'cycle':
         return await cycle(client, state);
       case 'upgrade':
-        return await upgrade(client, state);
+        return await upgrade(client, state, values.kit);
       case 'status':
         return await status(client, state);
       case 'destroy':

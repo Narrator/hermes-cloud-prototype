@@ -1,0 +1,31 @@
+
+$ node hermes.ts launch
+running after 10.5s
+prepared /home/agent/.hermes/profiles/persistent in 5.7s (seeded config.yaml, seeded .env, placeholder ANTHROPIC_API_KEY)
+sandbox hermes-agent  id sbx_001m5gfnc4534s1yyq95nezdnhk  volume volumes/vol_001m5gfnc2zyszfck17tycd526b  ready in 16.2s
+
+$ node hermes.ts ask In one sentence, what can you help me with?
+I can help you with practically anything you can do on a computer — writing and running code, searching the web, reading and editing files, browsing websites, managing tasks, connecting to apps, automating workflows, and answering questions — all through conversation.
+
+$ node hermes.ts remember I deploy to production on Tuesdays
+Saved — your Tuesday production deploy schedule is now in persistent memory.
+
+memory files on the volume:
+Deploys to production on Tuesdays.
+
+$ node hermes.ts cycle
+stopped (hibernated) in 111.5s
+started (resumed) in 5.4s; sbx_001m5gfnc4534s1yyq95nezdnhk is running
+
+$ node hermes.ts recall Which day do I deploy to production?
+Tuesdays.
+
+$ node hermes.ts upgrade
+deleted sbx_001m5gfnc4534s1yyq95nezdnhk in 0.9s
+running after 60.3s
+prepared /home/agent/.hermes/profiles/persistent in 0.7s
+sandbox hermes-agent  id sbx_001m5gfv3qjcyfw2prvhckyajkj  volume volumes/vol_001m5gfnc2zyszfck17tycd526b  ready in 61.0s
+upgrade took 62.1s
+
+$ node hermes.ts recall Which day do I deploy to production?
+Tuesdays.

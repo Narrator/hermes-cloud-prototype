@@ -49,13 +49,15 @@ Hermes keeps its state in `HERMES_HOME=/home/agent/.hermes/profiles/persistent`,
 
 ## Telegram
 
-The published kit, `docker.io/sbx/hermes-agent-kit:latest`, has no Telegram SDK and does not allow `api.telegram.org`, so the gateway fails there with `FeatureUnavailable`. Build and publish the kit from the `Narrator/hermes-telegram-demo` branch of docker/sbx-kits-contrib. Then pass its reference as `launch --kit <ref>`, or as `upgrade --kit <ref>` to move an existing sandbox onto it and keep the volume. The kit you pick is recorded, and later upgrades reuse it.
+The published kit, `docker.io/sbx/hermes-agent-kit:latest`, has no Telegram SDK and does not allow `api.telegram.org`, so the gateway fails there with `FeatureUnavailable`. A demo build from the `Narrator/hermes-telegram-demo` branch of docker/sbx-kits-contrib is public as `docker.io/kaushikgnanaskandan45643/hermes-agent-kit:telegram-demo` (amd64 and arm64). Pass it as `launch --kit <ref>`, or as `upgrade --kit <ref>` to move an existing sandbox onto it and keep the volume. The kit you pick is recorded, and later upgrades reuse it.
+
+`demo-run-telegram.txt` is the prod run on 2026-10-22: the sandbox moved onto the Telegram kit with its memory intact, the gateway connected in 16 s, and the bot answered before and after a hibernate and resume.
 
 `telegram --user-id <id>` reads the bot token from stdin only and never prints it. It writes `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ALLOWED_USERS` into the profile's `.env` on the volume, mode 0600. Hermes then ignores messages from anyone else. Running it again replaces both. The token has to live in the sandbox because Telegram puts it in the request URL, and the proxy only injects headers. Anything Hermes runs can read it, so use a bot made for the demo and revoke its token with @BotFather afterwards.
 
 It then starts `hermes gateway run --replace` as a background process. It runs on the default Hermes home, because Hermes 0.22 refuses a gateway of a profile's own and the default one serves every profile. The command waits until the gateway's status record says Telegram is connected, and fails with Hermes' own error otherwise. `status` shows the same state.
 
-After a `cycle`, the gateway process resumes with the sandbox. It notices the dead connection within about 60 seconds through socket keepalive, its 90-second heartbeat backs that up, and it retries for as long as it runs. Telegram keeps messages sent in the meantime for up to 24 hours and delivers them once the gateway reconnects.
+After a `cycle`, the gateway process resumes with the sandbox. It notices the dead connection within about 60 seconds through socket keepalive, its 90-second heartbeat backs that up, and it retries for as long as it runs. Telegram keeps messages sent in the meantime for up to 24 hours and delivers them once the gateway reconnects. A fresh gateway start, as after `upgrade`, drops them unless `platforms.telegram.extra.drop_pending_on_cold_boot` is `false` in the profile's `config.yaml`.
 
 ## Timeout options
 

@@ -1,0 +1,38 @@
+
+$ node hermes.ts status
+env      prod
+sandbox  hermes-agent  sbx_001m5gfv3qjcyfw2prvhckyajkj  running
+timeout  onTimeout restart  autoResume false  next 2026-10-23T01:24:12.579Z
+telegram no gateway
+volume   volumes/vol_001m5gfnc2zyszfck17tycd526b  mounted at /home/agent/.hermes/profiles/persistent
+mode     prepare
+kit      docker.io/sbx/hermes-agent-kit:latest
+secret   secrets/c26f141b-7586-4eca-bd8f-75e728d5099a (created here)
+
+$ node hermes.ts upgrade --kit docker.io/kaushikgnanaskandan45643/hermes-agent-kit:telegram-demo
+deleted sbx_001m5gfv3qjcyfw2prvhckyajkj in 1.2s
+running after 72.3s
+prepared /home/agent/.hermes/profiles/persistent in 0.7s
+sandbox hermes-agent  id sbx_001m5hrve0d38n610y5dqf7npsb  volume volumes/vol_001m5gfnc2zyszfck17tycd526b  kit docker.io/kaushikgnanaskandan45643/hermes-agent-kit:telegram-demo  ready in 73.1s
+upgrade took 74.5s
+
+$ node hermes.ts recall Which day do I deploy to production?
+Tuesdays.
+
+$ node hermes.ts telegram --user-id 6159251773
+stored the bot token and TELEGRAM_ALLOWED_USERS=6159251773 in /home/agent/.hermes/profiles/persistent/.env
+gateway connected to Telegram in 15.9s (pid 2027)
+
+$ node hermes.ts cycle
+stopped (hibernated) in 111.5s
+started (resumed) in 5.7s; sbx_001m5hrve0d38n610y5dqf7npsb is running
+
+$ node hermes.ts status
+env      prod
+sandbox  hermes-agent  sbx_001m5hrve0d38n610y5dqf7npsb  running
+timeout  onTimeout restart  autoResume false  next 2026-10-22T13:21:06.750Z
+telegram connected
+volume   volumes/vol_001m5gfnc2zyszfck17tycd526b  mounted at /home/agent/.hermes/profiles/persistent
+mode     prepare
+kit      docker.io/kaushikgnanaskandan45643/hermes-agent-kit:telegram-demo
+secret   secrets/c26f141b-7586-4eca-bd8f-75e728d5099a (created here)
